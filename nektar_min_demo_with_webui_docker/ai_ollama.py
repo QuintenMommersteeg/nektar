@@ -1,7 +1,9 @@
 # ai_ollama.py
-import os, re, json, time, requests
+import os, re, json, time, copy, hashlib, requests
 from typing import Dict, Any, Optional
 from datetime import datetime, timedelta
+from threading import RLock
+from requests.adapters import HTTPAdapter
 
 # === Config ===
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
@@ -9,6 +11,63 @@ OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "phi3")
 # AI-zinsbouw standaard AAN
 USE_LLM_VERBALIZE = os.getenv("USE_LLM_VERBALIZE", "1").lower() in ("1", "true", "yes")
+
+# === Simple infrastructuur voor snelheid ===
+class _TTLCache:
+    """Kleine thread-safe TTL-cache om herhaalde LLM-calls te beperken."""
+    __slots__ = ("_ttl", "_maxsize", "_store", "_lock")
+
+    def __init__(self, ttl_seconds: float, maxsize: int = 256):
+        self._ttl = ttl_seconds
+        self._maxsize = maxsize
+        self._store: Dict[str, tuple[float, Any]] = {}
+        self._lock = RLock()
+
+    def get(self, key: str):
+        now = time.time()
+        with self._lock:
+            item = self._store.get(key)
+            if not item:
+                return None
+            ts, value = item
+            if now - ts > self._ttl:
+                self._store.pop(key, None)
+                return None
+            return copy.deepcopy(value)
+
+    def set(self, key: str, value: Any):
+        payload = copy.deepcopy(value)
+        with self._lock:
+            if len(self._store) >= self._maxsize:
+                # verwijder oudste entry
+                oldest_key = min(self._store.items(), key=lambda kv: kv[1][0])[0]
+                self._store.pop(oldest_key, None)
+            self._store[key] = (time.time(), payload)
+
+
+_analyze_cache = _TTLCache(ttl_seconds=float(os.getenv("ANALYZE_CACHE_TTL", "90")), maxsize=128)
+_verbalize_cache = _TTLCache(ttl_seconds=float(os.getenv("VERBALIZE_CACHE_TTL", "300")), maxsize=256)
+_session_lock = RLock()
+_http_session: Optional[requests.Session] = None
+
+
+def _serialize_for_cache(obj: Any) -> str:
+    def _default(o):
+        return repr(o)
+    return json.dumps(obj, sort_keys=True, ensure_ascii=False, default=_default)
+
+
+def _http_client() -> requests.Session:
+    global _http_session
+    if _http_session is None:
+        with _session_lock:
+            if _http_session is None:
+                session = requests.Session()
+                adapter = HTTPAdapter(pool_connections=4, pool_maxsize=8)
+                session.mount("http://", adapter)
+                session.mount("https://", adapter)
+                _http_session = session
+    return _http_session
 
 # === Helpers ===
 def _balanced_json(text: str) -> Optional[dict]:
@@ -40,7 +99,7 @@ def _ollama_chat(messages: list, timeout=30, retries=2) -> str:
     last_err = None
     for attempt in range(retries + 1):
         try:
-            r = requests.post(
+            r = _http_client().post(
                 f"{OLLAMA_URL}/api/chat",
                 json={"model": OLLAMA_MODEL, "messages": messages, "stream": False},
                 timeout=timeout,
@@ -152,14 +211,23 @@ def _fallback_intent(question: str) -> Dict[str, Any]:
 
 # === Router via LLM (met pre-checks & failsafes) ===
 def analyze_question(question: str) -> Dict[str, Any]:
+    cache_key = question.strip()
+    cached = _analyze_cache.get(cache_key)
+    if cached:
+        return cached
+
     # PRE-ROUTER: vang direct '… voor/van <Naam Naam>' af
     qlow = (question or "").lower()
     person = _extract_name(question)
     if person:
         if "werkorder" in qlow or "order" in qlow:
-            return {"intent": "work_orders_for_customer", "params": {"customer_name": person}}
+            result = {"intent": "work_orders_for_customer", "params": {"customer_name": person}}
+            _analyze_cache.set(cache_key, result)
+            return result
         if "afspraak" in qlow or "appointment" in qlow or "agenda" in qlow:
-            return {"intent": "next_appointment_for_customer", "params": {"customer_name": person}}
+            result = {"intent": "next_appointment_for_customer", "params": {"customer_name": person}}
+            _analyze_cache.set(cache_key, result)
+            return result
 
     system = "Je bent een strikte JSON-router voor intents. Antwoord ALLEEN met JSON."
     prompt = """
@@ -214,56 +282,59 @@ A: {"intent":"search_all","params":{"q":"Band lek, wie kan dit morgen doen?"}}
         )
         payload = _balanced_json(content) if content else None
         if not payload or "intent" not in payload:
-            return _fallback_intent(question)
+            result = _fallback_intent(question)
+        else:
+            intent = payload.get("intent")
+            params = payload.get("params") or {}
+            if not isinstance(params, dict):
+                params = {}
 
-        intent = payload.get("intent")
-        params = payload.get("params") or {}
-        if not isinstance(params, dict):
-            params = {}
+            valid_intents = {
+                "list_customers",
+                "list_recent_work_orders",
+                "work_orders_for_customer",
+                "next_appointment_for_customer",
+                "work_orders_on_date",
+                "appointments_on_date",
+                "summary_on_date",
+                "search_all",
+            }
+            if intent not in valid_intents:
+                result = _fallback_intent(question)
+            else:
+                # guards
+                if "limit" in params:
+                    try:
+                        l = int(params["limit"])
+                        params["limit"] = max(1, min(l, 20))
+                    except Exception:
+                        params.pop("limit", None)
 
-        valid_intents = {
-            "list_customers",
-            "list_recent_work_orders",
-            "work_orders_for_customer",
-            "next_appointment_for_customer",
-            "work_orders_on_date",
-            "appointments_on_date",
-            "summary_on_date",
-            "search_all",
-        }
-        if intent not in valid_intents:
-            return _fallback_intent(question)
+                if "date" in params and params["date"] is not None:
+                    norm = _normalize_date(question, str(params["date"]))
+                    params["date"] = norm if norm else None
 
-        # guards
-        if "limit" in params:
-            try:
-                l = int(params["limit"])
-                params["limit"] = max(1, min(l, 20))
-            except Exception:
-                params.pop("limit", None)
+                # datum in vraag maar geen datum-intent? → corrigeer
+                has_date_in_question = bool(_normalize_date(question, None) or re.search(r"\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?", question or ""))
+                if has_date_in_question and intent not in {"work_orders_on_date", "appointments_on_date", "summary_on_date"}:
+                    chosen = "summary_on_date"
+                    if "afspraak" in qlow or "agenda" in qlow or "appointment" in qlow:
+                        chosen = "appointments_on_date"
+                    elif "werkorder" in qlow or "order" in qlow:
+                        chosen = "work_orders_on_date"
+                    params = {"date": _normalize_date(question, params.get("date")) or _normalize_date(question, None)}
+                    intent = chosen
 
-        if "date" in params and params["date"] is not None:
-            norm = _normalize_date(question, str(params["date"]))
-            params["date"] = norm if norm else None
-
-        # datum in vraag maar geen datum-intent? → corrigeer
-        has_date_in_question = bool(_normalize_date(question, None) or re.search(r"\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?", question or ""))
-        if has_date_in_question and intent not in {"work_orders_on_date", "appointments_on_date", "summary_on_date"}:
-            chosen = "summary_on_date"
-            if "afspraak" in qlow or "agenda" in qlow or "appointment" in qlow:
-                chosen = "appointments_on_date"
-            elif "werkorder" in qlow or "order" in qlow:
-                chosen = "work_orders_on_date"
-            params = {"date": _normalize_date(question, params.get("date")) or _normalize_date(question, None)}
-            intent = chosen
-
-        # niets passend? → zoekbreed
-        if intent not in valid_intents:
-            return {"intent": "search_all", "params": {"q": question}}
-
-        return {"intent": intent, "params": params}
+                # niets passend? → zoekbreed
+                if intent not in valid_intents:
+                    result = {"intent": "search_all", "params": {"q": question}}
+                else:
+                    result = {"intent": intent, "params": params}
     except Exception:
-        return _fallback_intent(question)
+        result = _fallback_intent(question)
+
+    _analyze_cache.set(cache_key, result)
+    return result
 
 # === AI-zinsbouw ===
 def _llm_verbalize(prompt: str) -> str:
@@ -278,6 +349,15 @@ def _llm_verbalize(prompt: str) -> str:
 
 # === Verwoorden van DB-resultaten → zin(nen) ===
 def verbalize(question: str, intent: str, result) -> str:
+    cache_key = hashlib.sha256(
+        (
+            question + "\u241f" + intent + "\u241f" + _serialize_for_cache(result)
+        ).encode("utf-8")
+    ).hexdigest()
+    cached = _verbalize_cache.get(cache_key)
+    if cached:
+        return cached
+
     def fmt_dt(s: str) -> str:
         try:
             return datetime.strptime(s, "%Y-%m-%d %H:%M").strftime("%d-%m-%Y %H:%M")
@@ -381,7 +461,11 @@ def verbalize(question: str, intent: str, result) -> str:
             polished = _llm_verbalize(
                 f"Vraag: {question}\nHuidige tekst: {text}\nZet dit om naar 1–2 duidelijke, natuurlijke NL-zinnen, feitelijk, zonder aannames."
             )
-            return polished or text
+            final_text = polished or text
         except Exception:
-            return text
-    return text
+            final_text = text
+    else:
+        final_text = text
+
+    _verbalize_cache.set(cache_key, final_text)
+    return final_text
