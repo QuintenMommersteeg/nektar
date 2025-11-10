@@ -233,7 +233,13 @@ def _fallback_intent(question: str) -> Dict[str, Any]:
     has_work = _contains_any(q, *work_terms)
     has_appt = _contains_any(q, *appointment_terms)
     has_customer = _contains_any(q, *customer_terms)
-    wants_list = _contains_any(q, "overzicht", "alle", "lijst", "list", "toon", "show", "geef", "display", "noem", "som op", "who are", "wie zijn")
+    wants_list = _contains_any(
+        q,
+        "overzicht", "alle", "lijst", "list", "toon", "show", "geef", "display",
+        "noem", "som op", "who are", "wie zijn", "welke klanten", "welke customer",
+        "welke customers", "welke client", "welke clients", "which customers",
+        "which client", "which clients", "what customers", "wat voor klanten"
+    )
     wants_summary = _contains_any(q, *summary_terms)
     wants_search = _contains_any(q, "zoek", "search", "vind", "find", "lookup", "zoeken")
     ask_next = _contains_any(q, "volgende", "next", "upcoming", "komende", "aanstaande", "binnenkort")
@@ -264,7 +270,12 @@ def _fallback_intent(question: str) -> Dict[str, Any]:
         # default to summary zodra datum herkend is
         return {"intent": "summary_on_date", "params": {"date": date_norm}}
 
-    if has_customer and wants_list:
+    if has_customer and (
+        wants_list
+        or re.search(r"\b(welke|which)\b", q)
+        or re.search(r"\b(wat zijn|what are)\b", q)
+        or "er" in q and _contains_all(q, "klanten", "zijn")
+    ):
         return {"intent": "list_customers", "params": {}}
     if _contains_any(q, "klantenlijst", "customer list"):
         return {"intent": "list_customers", "params": {}}
