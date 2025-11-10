@@ -1,0 +1,32 @@
+
+version: "3.9"
+
+services:
+  app:
+    build: .
+    container_name: nektar-demo-app
+    ports:
+      - "8000:8000"
+    environment:
+      # Optioneel: zet je OpenAI-sleutel hier of in een .env naast docker-compose.yml
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o-mini}
+      # Als je met Ollama werkt en de import aanpast naar ai_ollama.py
+      OLLAMA_URL: ${OLLAMA_URL:-http://ollama:11434}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.1:8b}
+    # Uncomment als je live code wilt mounten i.p.v. de image (dev-mode)
+    # volumes:
+    #   - ./:/app
+
+  # Optioneel: lokaal LLM via Ollama (start met: docker compose --profile ollama up)
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    profiles: ["ollama"]
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+
+volumes:
+  ollama_data:
