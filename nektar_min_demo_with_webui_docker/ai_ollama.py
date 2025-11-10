@@ -45,6 +45,9 @@ class _TTLCache:
             self._store[key] = (time.time(), payload)
 
 
+_ANALYZE_CACHE_VERSION = os.getenv("ANALYZE_CACHE_VERSION", "2")
+_VERBALIZE_CACHE_VERSION = os.getenv("VERBALIZE_CACHE_VERSION", "1")
+
 _analyze_cache = _TTLCache(ttl_seconds=float(os.getenv("ANALYZE_CACHE_TTL", "90")), maxsize=128)
 _verbalize_cache = _TTLCache(ttl_seconds=float(os.getenv("VERBALIZE_CACHE_TTL", "300")), maxsize=256)
 _session_lock = RLock()
@@ -302,12 +305,15 @@ def _fallback_intent(question: str) -> Dict[str, Any]:
 
 # === Router via LLM (met pre-checks & failsafes) ===
 def analyze_question(question: str) -> Dict[str, Any]:
-    cache_key = question.strip()
+    normalized_question = question.strip()
+    cache_key = hashlib.sha256(
+        f"{_ANALYZE_CACHE_VERSION}\u241f{normalized_question}".encode("utf-8")
+    ).hexdigest()
     cached = _analyze_cache.get(cache_key)
-    if cached:
-        return cached
 
     fallback_result = _fallback_intent(question)
+    if cached and cached.get("intent") != "search_all":
+        return cached
     if fallback_result.get("intent") != "search_all":
         _analyze_cache.set(cache_key, fallback_result)
         return fallback_result
@@ -436,7 +442,7 @@ def _llm_verbalize(prompt: str) -> str:
 def verbalize(question: str, intent: str, result) -> str:
     cache_key = hashlib.sha256(
         (
-            question + "\u241f" + intent + "\u241f" + _serialize_for_cache(result)
+            _VERBALIZE_CACHE_VERSION + "\u241f" + question + "\u241f" + intent + "\u241f" + _serialize_for_cache(result)
         ).encode("utf-8")
     ).hexdigest()
     cached = _verbalize_cache.get(cache_key)
